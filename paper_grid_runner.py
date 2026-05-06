@@ -54,6 +54,61 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         w.writerows(rows)
 
 
+def write_report(path: Path, rows: list[dict[str, Any]], *, total_sec: float | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    headers = [
+        "arch",
+        "name",
+        "seed",
+        "epochs",
+        "min_k95",
+        "p0",
+        "pN",
+        "pNC",
+        "pC",
+        "fN",
+        "fNC",
+        "train_loss",
+        "val_loss",
+        "best_acc",
+        "sec",
+    ]
+
+    def val(row: dict[str, Any], key: str, nd: int = 4) -> str:
+        x = safe_float(row.get(key))
+        if x is None:
+            return "NA"
+        return f"{x:.{nd}f}"
+
+    lines = []
+    lines.append(" ".join(f"{h:>12}" for h in headers))
+    lines.append(" ".join("-" * 12 for _ in headers))
+    for row in rows:
+        parts = [
+            str(row.get("arch_id", "")),
+            str(row.get("arch_name", ""))[:12],
+            str(row.get("seed", "")),
+            str(row.get("epochs", "")),
+            str(row.get("min_k95", "")),
+            val(row, "p0_random_init_accuracy"),
+            val(row, "pN_nadir_accuracy"),
+            val(row, "pNC_accuracy"),
+            val(row, "pC_final_accuracy"),
+            val(row, "f_compression"),
+            val(row, "f_compression_pNC"),
+            val(row, "final_lm_train_loss"),
+            val(row, "final_lm_val_loss"),
+            val(row, "best_probe_accuracy"),
+            val(row, "total_sec", 1),
+        ]
+        lines.append(" ".join(f"{p:>12}" for p in parts))
+    if total_sec is not None:
+        lines.append("")
+        lines.append(f"TOTAL_SEC {total_sec:.1f}")
+        lines.append(f"TOTAL_MIN {total_sec / 60:.2f}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def safe_float(x: Any) -> float | None:
     if x is None:
         return None
@@ -145,7 +200,6 @@ def build_train_cmd(args: argparse.Namespace, arch: Arch, seed: int, out_dir: Pa
         "--vocab", args.vocab,
         "--out-dir", str(out_dir / "ckpts"),
         "--epochs", str(args.epochs),
-        "--epoch1-snapshots", str(args.epoch1_snapshots),
         "--batch-size", str(args.train_batch_size),
         "--ctx-len", str(args.ctx_len),
         "--lr", str(args.lr),
@@ -158,6 +212,10 @@ def build_train_cmd(args: argparse.Namespace, arch: Arch, seed: int, out_dir: Pa
         "--fused-adamw",
         "--pin-memory",
     ]
+    if args.snapshots_per_epoch > 0:
+        cmd.extend(["--snapshots-per-epoch", str(args.snapshots_per_epoch)])
+    else:
+        cmd.extend(["--epoch1-snapshots", str(args.epoch1_snapshots)])
     cmd.extend(arch.train_args())
     return cmd
 
@@ -273,7 +331,10 @@ def merge_run(args: argparse.Namespace, arch: Arch, seed: int, out_dir: Path) ->
         "pNC_checkpoint_step": pnc["checkpoint_step"],
         "pNC_k95": pnc["spectral_k_after_layer1"],
         "pNC_accuracy": pnc["probe_val_top1_accuracy"],
+        "pNC": pnc["probe_val_top1_accuracy"],
         "f_compression_pNC": ((pnc["probe_val_top1_accuracy"] - p0) / den) if den and abs(den) > 1e-12 else None,
+        "final_lm_train_loss": details[-1]["lm_train_loss"],
+        "final_lm_val_loss": details[-1]["lm_val_loss"],
         "final_lm_train_ppl": details[-1]["lm_train_ppl"],
         "final_lm_val_ppl": details[-1]["lm_val_ppl"],
         "final_k95": details[-1]["spectral_k_after_layer1"],
@@ -295,9 +356,11 @@ def main(argv: list[str]) -> int:
     p.add_argument("--k95-script", default="fast_probe_k95.py")
     p.add_argument("--probe-script", default="fast_probe_rc_scenario_ckpts.py")
     p.add_argument("--arch-ids", default="all")
+    p.add_argument("--seed", type=int, default=None, help="single seed to use for every selected architecture")
     p.add_argument("--seeds", default="1401,1402,1403,1404,1405,1406,1407,1408,1409,1410", help="one seed per selected architecture, or one seed reused if only one value is provided")
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--epoch1-snapshots", type=int, default=30)
+    p.add_argument("--snapshots-per-epoch", type=int, default=0, help="if >0, save this many snapshots in every epoch; useful for multi-epoch cluster runs")
     p.add_argument("--ctx-len", type=int, default=1024)
     p.add_argument("--train-batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=3e-4)
@@ -324,7 +387,7 @@ def main(argv: list[str]) -> int:
     if args.arch_ids != "all":
         keep = {int(x) for x in args.arch_ids.split(",") if x.strip()}
         arches = [a for a in arches if a.arch_id in keep]
-    seeds = [int(x) for x in args.seeds.split(",") if x.strip()]
+    seeds = [int(args.seed)] if args.seed is not None else [int(x) for x in args.seeds.split(",") if x.strip()]
     if len(seeds) == 1:
         seeds = seeds * len(arches)
     if len(seeds) != len(arches):
@@ -365,12 +428,16 @@ def main(argv: list[str]) -> int:
         summary["k95_sec"] = k95_sec
         summary["probe_sec"] = probe_sec
         summary["total_sec"] = time.perf_counter() - t0
+        summary["epochs"] = args.epochs
+        summary["snapshots_per_epoch"] = args.snapshots_per_epoch
         summaries.append(summary)
         all_details.extend(details)
+        write_report(run_root / "paper_grid_report.txt", summaries, total_sec=time.perf_counter() - total_t0)
         print(
             f"[{now()}] DONE arch={arch.arch_id}:{arch.name} seed={seed} "
             f"min_k={summary['min_k95']} p0={summary['p0_random_init_accuracy']:.4f} "
-            f"pN={summary['pN_nadir_accuracy']:.4f} pC={summary['pC_final_accuracy']:.4f} "
+            f"pN={summary['pN_nadir_accuracy']:.4f} pNC={summary['pNC_accuracy']:.4f} "
+            f"pC={summary['pC_final_accuracy']:.4f} "
             f"sec={summary['total_sec']:.1f}",
             flush=True,
         )
@@ -378,6 +445,7 @@ def main(argv: list[str]) -> int:
     if not args.dry_run:
         write_csv(run_root / "paper_grid_summary.csv", summaries)
         write_csv(run_root / "paper_grid_details.csv", all_details)
+        write_report(run_root / "paper_grid_report.txt", summaries, total_sec=time.perf_counter() - total_t0)
         collated = {
             "metadata": metadata,
             "summary_rows": summaries,
