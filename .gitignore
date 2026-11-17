@@ -1,2 +1,21 @@
-/runs_paper_grid_local
-/__pycache__
+# Experiment outputs and checkpoints
+/runs/
+/runs_paper_grid_local/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Generated datasets — if reproducible and not intended for Git
+/data/
+
+# Temporary/cache files
+/tmp/
+__pycache__/
+*.py[cod]
+
+# Separate third-party Git checkouts
+/vendor/
+
+# Everything
+*
